@@ -1,0 +1,214 @@
+global
+    maxconn 1024
+    pidfile /var/run/haproxy.pid
+
+    lua-load /etc/haproxy/acme-http01-webroot.lua
+
+    # Default ciphers to use on SSL-enabled listening sockets.
+    # For more information, see ciphers(1SSL).
+    ssl-default-bind-ciphers ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:RSA+3DES:!aNULL:!MD5:!DSS;
+    tune.ssl.default-dh-param 4096
+
+defaults
+    balance roundrobin
+    mode http
+    option abortonclose
+    option forwardfor
+    option http-server-close
+{{if .Env.STATS_ENABLE}}
+    stats enable
+    stats hide-version
+    stats refresh 5s
+    stats uri /haproxy
+    stats realm Haproxy\ Statistics
+    stats auth {{.Env.STATS_USER}}:{{.Env.STATS_PASSWORD}}
+{{end}}
+    timeout client 60m
+    timeout connect 60m
+    timeout server 60m
+    timeout client-fin 60m
+    timeout tunnel 12h
+    errorfile 503 /config/503.http.html
+
+frontend http
+    bind :80
+    acl url_acme_http01 path_beg /.well-known/acme-challenge/
+    http-request use-service lua.acme-http01 if METH_GET url_acme_http01
+    option forwardfor
+    http-request set-header X-Forwarded-Port %[dst_port]
+
+{{range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST_SECURE" ","}}
+    redirect scheme https code 301 if { hdr(host) -i {{$host}} } !{ ssl_fc }
+{{end}}
+{{range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST" ","}}
+    use_backend http_{{$host}} if { hdr(host) -i {{$host}} }
+{{end}}
+{{range $host, $containers := groupByMulti $ "Env.HTTP_REDIRECT_FROM" ","}}
+    use_backend redirect_{{$host}} if { hdr(host) -i {{$host}} } !url_acme_http01
+{{end}}
+
+${frontend_http}
+
+frontend https
+    bind :443 ssl no-sslv3 crt /etc/letsencrypt/live
+    option forwardfor
+    http-request set-header X-Forwarded-Port %[dst_port]
+    http-request add-header X-Forwarded-Proto https
+    capture request header origin len 128
+    capture response header Set-Cookie len 128
+{{if .Env.PRERENDER_HOST}}
+    acl url-escaped-fragment url_sub _escaped_fragment_
+    acl url-asset path_end js css xml less png jpg jpeg gif pdf doc txt ico rss zip mp3 rar exe wmv doc avi ppt mpg mpeg tif wav mov psd ai xls mp4 m4a swf dat dmg iso flv m4v torrent ttf woff
+    acl user-agent-bot hdr_sub(User-Agent) -i baiduspider twitterbot facebookexternalhit rogerbot linkedinbot embedly showyoubot outbrain pinterest slackbot vkShare W3C_Validator
+    use_backend prerender if url-escaped-fragment !url-asset
+    use_backend prerender if user-agent-bot !url-asset
+{{end}}
+
+{{range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST_SECURE" ","}}
+    use_backend https_{{$host}} if { ssl_fc_sni {{$host}} }
+    use_backend https_{{$host}} if { hdr(host) -i {{$host}} }
+{{end}}
+{{range $host, $containers := groupByMulti $ "Env.HTTP_REDIRECT_FROM" ","}}
+    use_backend redirect_{{$host}} if { ssl_fc_sni {{$host}} }
+    use_backend redirect_{{$host}} if { hdr(host) -i {{$host}} }
+{{end}}
+{{if .Env.EXPOSE_DOCKER_API_HOST}}
+    use_backend https_docker_engine if { ssl_fc_sni docker.gus.sismics.com }
+    use_backend https_docker_engine if { hdr(host) -i docker.gus.sismics.com }
+{{end}}
+
+${frontend_https}
+
+{{range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST" ","}}
+    {{range $index, $container := $containers}}
+        {{if $container.Env.BASIC_AUTH_USER}}
+userlist users_{{$container.ID}}
+    user {{$container.Env.BASIC_AUTH_USER}} insecure-password {{$container.Env.BASIC_AUTH_PASSWORD}}
+        {{end}}
+    {{end}}
+{{end}}
+
+backend http
+
+{{range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST" ","}}
+backend http_{{$host}}
+    {{range $index, $container := $containers}}
+        {{$addrLen := len $container.Addresses}}
+        {{/* If only 1 port exposed, use that */}}
+        {{if eq $addrLen 1}}
+            {{with $address := index $container.Addresses 0}}
+    server {{$address.IP}}:{{$address.Port}} {{$address.IP}}:{{$address.Port}} check
+            {{end}}
+        {{/* If more than one port exposed, use the one matching VIRTUAL_PORT env var */}}
+        {{else if $container.Env.VIRTUAL_PORT}}
+            {{range $i, $address := $container.Addresses}}
+                {{if eq $address.Port $container.Env.VIRTUAL_PORT}}
+    server {{$address.IP}}:{{$address.Port}} {{$address.IP}}:{{$address.Port}} check
+                {{end}}
+            {{end}}
+        {{/* Else default to standard web port 80 */}}
+        {{else}}
+            {{range $i, $address := $container.Addresses}}
+                {{if eq $address.Port "80"}}
+    server {{$address.IP}}:{{$address.Port}} {{$address.IP}}:{{$address.Port}} check
+                {{end}}
+            {{end}}
+        {{end}}
+        
+        {{if $container.Env.BASIC_AUTH_USER}}
+    acl auth_{{$container.ID}} http_auth(users_{{$container.ID}})
+    {{/* Allow CORS preflight requests regardless of basic authentication */}}
+    acl auth_{{$container.ID}} method -i OPTIONS
+    http-request auth realm {{$host}} if !auth_{{$container.ID}}
+        {{end}}
+    {{end}}
+{{end}}
+
+{{range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST_SECURE" ","}}
+    {{range $index, $container := $containers}}
+        {{if $container.Env.BASIC_AUTH_USER}}
+userlist users_{{$container.ID}}
+    user {{$container.Env.BASIC_AUTH_USER}} insecure-password {{$container.Env.BASIC_AUTH_PASSWORD}}
+        {{end}}
+    {{end}}
+{{end}}
+
+{{if .Env.EXPOSE_DOCKER_API_USER}}
+userlist users_docker_engine
+    user {{.Env.EXPOSE_DOCKER_API_USER}} insecure-password {{.Env.EXPOSE_DOCKER_API_PASSWORD}}
+{{end}}
+
+backend https
+
+{{range $host, $containers := groupByMulti $ "Env.VIRTUAL_HOST_SECURE" ","}}
+backend https_{{$host}}
+    {{range $index, $container := $containers}}
+        {{$addrLen := len $container.Addresses}}
+        {{/* If only 1 port exposed, use that */}}
+        {{if eq $addrLen 1}}
+            {{with $address := index $container.Addresses 0}}
+    server {{$address.IP}}:{{$address.Port}} {{$address.IP}}:{{$address.Port}} check
+            {{end}}
+        {{/* If more than one port exposed, use the one matching VIRTUAL_PORT env var */}}
+        {{else if $container.Env.VIRTUAL_PORT}}
+            {{range $i, $address := $container.Addresses}}
+                {{if eq $address.Port $container.Env.VIRTUAL_PORT}}
+    server {{$address.IP}}:{{$address.Port}} {{$address.IP}}:{{$address.Port}} check
+                {{end}}
+            {{end}}
+        {{/* Else default to standard web port 80 */}}
+        {{else}}
+            {{range $i, $address := $container.Addresses}}
+                {{if eq $address.Port "80"}}
+    server {{$address.IP}}:{{$address.Port}} {{$address.IP}}:{{$address.Port}} check
+                {{end}}
+            {{end}}
+        {{end}}
+
+        {{if $container.Env.BASIC_AUTH_USER}}
+    acl auth_{{$container.ID}} http_auth(users_{{$container.ID}})
+    {{/* Allow CORS preflight requests regardless of basic authentication */}}
+    acl auth_{{$container.ID}} method -i OPTIONS
+    http-request auth realm {{$host}} if !auth_{{$container.ID}}
+        {{end}}
+
+        {{/* Enable requests from all origins (not very secure) */}}
+        {{if $container.Env.ENABLE_CORS}}
+        {{if not $container.Env.DISABLE_CORS_ORIGIN_HEADER}}
+    http-response add-header Access-Control-Allow-Origin %[capture.req.hdr(0)] if { capture.req.hdr(0) -m found }
+        {{end}}
+    http-response add-header Access-Control-Allow-Credentials true if { capture.req.hdr(0) -m found }
+    http-response add-header Access-Control-Max-Age 3600 if { capture.req.hdr(0) -m found }
+    rspadd Access-Control-Allow-Methods:\ GET,\ POST,\ PUT,\ OPTIONS,\ DELETE if { capture.req.hdr(0) -m found }
+    rspadd Access-Control-Allow-Headers:\ Origin,\ X-Requested-With,\ Content-Type,\ Accept,\ Authorization if { capture.req.hdr(0) -m found }
+    http-response add-header P3P CP="IE" if { capture.res.hdr(0) -m found }
+        {{end}}
+    {{end}}
+{{end}}
+
+{{if .Env.EXPOSE_DOCKER_API_HOST}}
+backend https_docker_engine
+    server docker_engine /var/run/docker.sock check
+    {{if .Env.EXPOSE_DOCKER_API_USER}}
+    acl auth_docker_engine http_auth(users_docker_engine)
+    http-request auth realm docker_engine if !auth_docker_engine
+    {{end}}
+{{end}}
+
+${backend_https}
+
+{{range $host, $containers := groupByMulti $ "Env.HTTP_REDIRECT_FROM" ","}}
+backend redirect_{{$host}}
+    {{/* TODO Does not work for non secure virtual host and for multiple secure virtual hosts on one container */}}
+    {{range $index, $container := $containers}}
+    http-request redirect code 301 location https://{{$container.Env.VIRTUAL_HOST_SECURE}}%[capture.req.uri]
+    {{end}}
+{{end}}
+
+{{if .Env.PRERENDER_HOST}}
+backend prerender
+    server prerender {{.Env.PRERENDER_HOST}}:80 check
+    http-request set-header Authorization Basic\ {{.Env.PRERENDER_AUTH_HEADER}}
+    http-request set-path /https://%[hdr(host)]%[path]
+    http-request set-header Host {{.Env.PRERENDER_HOST}}
+{{end}}

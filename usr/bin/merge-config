@@ -1,0 +1,6 @@
+#!/bin/sh
+template=$(cat "/var/dockergen/haproxy.cfg")
+frontend_http=`cat /var/haproxy_multidomain/frontend_http`
+frontend_https=`cat /var/haproxy_multidomain/frontend_https`
+backend_https=`cat /var/haproxy_multidomain/backend_https`
+eval "echo \"${template}\"" > /data/haproxy.cfg
